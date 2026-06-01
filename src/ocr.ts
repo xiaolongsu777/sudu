@@ -1,8 +1,13 @@
-import { createWorker, PSM, type Worker } from "tesseract.js";
+import type { OcrResultItem, OcrRuntimeParamsInput } from "@paddleocr/paddleocr-js";
 import { createEmptyGrid } from "./sudoku";
 import type { RecognitionResult, SudokuGrid } from "./types";
 
 type ProgressCallback = (message: string, progress?: number) => void;
+
+type PaddleOcrEngine = {
+  predict(input: unknown, params?: OcrRuntimeParamsInput): Promise<Array<{ items: OcrResultItem[] }>>;
+  dispose(): Promise<void>;
+};
 
 type DigitCandidate = {
   digit: number | null;
@@ -27,9 +32,15 @@ type GridGeometry = {
 };
 
 const CELL_COUNT = 9;
-const OCR_WHITELIST = "123456789";
-const OCR_ACCEPT_CONFIDENCE = 30;
+const BOARD_ACCEPT_CONFIDENCE = 18;
+const OCR_ACCEPT_CONFIDENCE = 42;
 const MIN_INK_RATIO = 0.004;
+const ORT_WASM_PATHS =
+  import.meta.env.MODE === "development"
+    ? "/node_modules/onnxruntime-web/dist/"
+    : new URL("ort/", window.location.href).href;
+
+let paddleOcrPromise: Promise<PaddleOcrEngine> | null = null;
 
 export async function recognizeSudokuFromImage(file: File, onProgress?: ProgressCallback): Promise<RecognitionResult> {
   const sourceImageUrl = URL.createObjectURL(file);
@@ -41,30 +52,23 @@ export async function recognizeSudokuFromImage(file: File, onProgress?: Progress
   const confidence = createEmptyGrid().map((row) => row.map(() => 0));
   const warnings: string[] = [];
 
-  onProgress?.("正在加载浏览器 OCR", 0.08);
-  const worker = await createWorker("eng", 1, {
-    logger: (event) => {
-      if (event.status === "recognizing text") {
-        onProgress?.("正在识别数字", 0.2 + event.progress * 0.7);
-      }
+  try {
+    onProgress?.("正在加载 PaddleOCR 模型", 0.08);
+    const ocr = await getPaddleOcr();
+
+    onProgress?.("正在整板识别", 0.16);
+    applyCandidates(grid, confidence, await recognizeBoard(square, geometry, ocr));
+
+    if (grid.flat().filter(Boolean).length < 24) {
+      onProgress?.("正在逐格补识别", 0.28);
+      await recognizeCells(square, geometry, ocr, grid, confidence, onProgress);
     }
-  });
 
-  await worker.setParameters({
-    tessedit_char_whitelist: OCR_WHITELIST,
-    tessedit_pageseg_mode: PSM.SPARSE_TEXT
-  });
-
-  onProgress?.("正在整板识别", 0.16);
-  applyCandidates(grid, confidence, await recognizeBoard(square, geometry, worker));
-
-  if (grid.flat().filter(Boolean).length < 24) {
-    onProgress?.("正在补充识别空格", 0.28);
-    await recognizeCells(square, geometry, worker, grid, confidence, onProgress);
+    removeDuplicateConflicts(grid, confidence);
+  } catch (error) {
+    await resetPaddleOcr();
+    throw new Error(error instanceof Error ? `OCR 模型加载或识别失败：${error.message}` : "OCR 模型加载或识别失败");
   }
-
-  removeDuplicateConflicts(grid, confidence);
-  await worker.terminate();
 
   const filled = grid.flat().filter(Boolean).length;
   if (filled === 0) {
@@ -72,48 +76,66 @@ export async function recognizeSudokuFromImage(file: File, onProgress?: Progress
   } else if (filled < 17) {
     warnings.push("识别到的数字偏少，建议对照原图补齐后再求解。");
   } else {
-    warnings.push("已按检测到的棋盘边界回填位置，并自动清掉明显重复冲突的低置信数字。");
+    warnings.push("已按检测到的棋盘边界回填位置，并自动清理明显重复冲突的低置信数字。");
   }
   warnings.push("黄色格代表低置信度，红色格代表仍需手动处理的冲突。");
 
   return { grid, confidence, sourceImageUrl, warnings };
 }
 
-async function recognizeBoard(square: HTMLCanvasElement, geometry: GridGeometry, worker: Worker): Promise<CellCandidate[]> {
-  const cleanBoard = eraseGridLines(preprocessCanvas(square, 150), geometry);
-  const result = await worker.recognize(cleanBoard, {}, { blocks: true, text: true });
-  const symbols = result.data.symbols ?? [];
-  const candidates: CellCandidate[] = [];
-
-  for (const symbol of symbols) {
-    const digit = parseRecognizedDigit(symbol.text);
-    if (!digit || symbol.confidence < 18) continue;
-
-    const centerX = (symbol.bbox.x0 + symbol.bbox.x1) / 2;
-    const centerY = (symbol.bbox.y0 + symbol.bbox.y1) / 2;
-    const col = Math.floor((centerX - geometry.x0) / geometry.cellWidth);
-    const row = Math.floor((centerY - geometry.y0) / geometry.cellHeight);
-
-    if (row < 0 || row >= CELL_COUNT || col < 0 || col >= CELL_COUNT) continue;
-    candidates.push({ row, col, digit, confidence: Math.max(0, Math.min(100, symbol.confidence + 8)) });
+async function getPaddleOcr(): Promise<PaddleOcrEngine> {
+  if (!paddleOcrPromise) {
+    const { PaddleOCR } = await import("@paddleocr/paddleocr-js");
+    paddleOcrPromise = PaddleOCR.create({
+      textDetectionModelName: "PP-OCRv5_mobile_det",
+      textRecognitionModelName: "PP-OCRv5_mobile_rec",
+      textDetectionBatchSize: 1,
+      textRecognitionBatchSize: 8,
+      ortOptions: {
+        backend: "wasm",
+        wasmPaths: ORT_WASM_PATHS,
+        numThreads: 1,
+        simd: true
+      }
+    });
   }
 
-  return candidates;
+  return paddleOcrPromise;
+}
+
+async function resetPaddleOcr() {
+  const current = paddleOcrPromise;
+  paddleOcrPromise = null;
+
+  if (!current) return;
+  try {
+    const ocr = await current;
+    await ocr.dispose();
+  } catch {
+    // If initialization failed, there may be no runtime to dispose.
+  }
+}
+
+async function recognizeBoard(square: HTMLCanvasElement, geometry: GridGeometry, ocr: PaddleOcrEngine): Promise<CellCandidate[]> {
+  const cleanBoard = eraseGridLines(preprocessCanvas(square, 150), geometry);
+  const [result] = await ocr.predict(cleanBoard, {
+    textDetLimitType: "max",
+    textDetLimitSideLen: 960,
+    textDetBoxThresh: 0.08,
+    textRecScoreThresh: 0.05
+  });
+
+  return mapOcrItemsToCells(result.items, geometry, BOARD_ACCEPT_CONFIDENCE);
 }
 
 async function recognizeCells(
   square: HTMLCanvasElement,
   geometry: GridGeometry,
-  worker: Worker,
+  ocr: PaddleOcrEngine,
   grid: SudokuGrid,
   confidence: number[][],
   onProgress?: ProgressCallback
 ) {
-  await worker.setParameters({
-    tessedit_char_whitelist: OCR_WHITELIST,
-    tessedit_pageseg_mode: PSM.SINGLE_CHAR
-  });
-
   for (let row = 0; row < CELL_COUNT; row += 1) {
     for (let col = 0; col < CELL_COUNT; col += 1) {
       if (grid[row][col]) continue;
@@ -128,16 +150,17 @@ async function recognizeCells(
       const candidates: DigitCandidate[] = [];
 
       for (const variant of variants) {
-        const blob = await canvasToBlob(variant);
-        const result = await worker.recognize(blob);
-        candidates.push({
-          digit: parseRecognizedDigit(result.data.text),
-          confidence: Math.max(0, Math.min(100, result.data.confidence))
+        const [result] = await ocr.predict(variant, {
+          textDetLimitType: "max",
+          textDetLimitSideLen: 192,
+          textDetBoxThresh: 0.04,
+          textRecScoreThresh: 0.03
         });
+        candidates.push(bestDigitFromItems(result.items));
       }
 
       const best = voteCandidates(candidates);
-      if (best.digit && (best.confidence >= OCR_ACCEPT_CONFIDENCE || ((best.votes ?? 0) >= 2 && best.confidence >= 24))) {
+      if (best.digit && (best.confidence >= OCR_ACCEPT_CONFIDENCE || ((best.votes ?? 0) >= 2 && best.confidence >= 32))) {
         grid[row][col] = best.digit;
         confidence[row][col] = Math.round(best.confidence);
       }
@@ -145,6 +168,60 @@ async function recognizeCells(
       reportCellProgress(onProgress, row, col);
     }
   }
+}
+
+function mapOcrItemsToCells(items: OcrResultItem[], geometry: GridGeometry, minConfidence: number): CellCandidate[] {
+  const candidates: CellCandidate[] = [];
+
+  for (const item of items) {
+    const digit = parseRecognizedDigit(item.text);
+    const confidence = scoreToConfidence(item.score);
+    if (!digit || confidence < minConfidence) continue;
+
+    const { x, y } = centerOfPoly(item.poly);
+    const col = Math.floor((x - geometry.x0) / geometry.cellWidth);
+    const row = Math.floor((y - geometry.y0) / geometry.cellHeight);
+
+    if (row < 0 || row >= CELL_COUNT || col < 0 || col >= CELL_COUNT) continue;
+    candidates.push({ row, col, digit, confidence });
+  }
+
+  return candidates;
+}
+
+function bestDigitFromItems(items: OcrResultItem[]): DigitCandidate {
+  let best: DigitCandidate = { digit: null, confidence: 0 };
+
+  for (const item of items) {
+    const digit = parseRecognizedDigit(item.text);
+    const confidence = scoreToConfidence(item.score);
+    if (digit && confidence > best.confidence) {
+      best = { digit, confidence };
+    }
+  }
+
+  return best;
+}
+
+function scoreToConfidence(score: number): number {
+  const normalized = score <= 1 ? score * 100 : score;
+  return Math.max(0, Math.min(100, normalized));
+}
+
+function centerOfPoly(poly: Array<[number, number]>): { x: number; y: number } {
+  if (poly.length === 0) return { x: 0, y: 0 };
+  const total = poly.reduce(
+    (sum, point) => ({
+      x: sum.x + point[0],
+      y: sum.y + point[1]
+    }),
+    { x: 0, y: 0 }
+  );
+
+  return {
+    x: total.x / poly.length,
+    y: total.y / poly.length
+  };
 }
 
 function applyCandidates(grid: SudokuGrid, confidence: number[][], candidates: CellCandidate[]) {
@@ -243,8 +320,8 @@ function detectAxisBounds(canvas: HTMLCanvasElement, axis: "x" | "y"): { start: 
 
   if (strongGroups.length >= 2) {
     return {
-      start: centerOf(strongGroups[0]),
-      end: centerOf(strongGroups[strongGroups.length - 1])
+      start: centerOfGroup(strongGroups[0]),
+      end: centerOfGroup(strongGroups[strongGroups.length - 1])
     };
   }
 
@@ -270,7 +347,7 @@ function collectLineGroups(scores: number[], threshold: number, maxWidth: number
   return groups;
 }
 
-function centerOf(group: { start: number; end: number }) {
+function centerOfGroup(group: { start: number; end: number }) {
   return (group.start + group.end) / 2;
 }
 
@@ -335,8 +412,8 @@ function cropCell(source: HTMLCanvasElement, geometry: GridGeometry, row: number
   const insetX = geometry.cellWidth * 0.2;
   const insetY = geometry.cellHeight * 0.2;
   const canvas = document.createElement("canvas");
-  canvas.width = 72;
-  canvas.height = 72;
+  canvas.width = 160;
+  canvas.height = 160;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
   if (!ctx) throw new Error("浏览器不支持 Canvas");
   ctx.fillStyle = "#ffffff";
@@ -422,26 +499,16 @@ function voteCandidates(candidates: DigitCandidate[]): DigitCandidate {
   return { digit: bestDigit, confidence: Math.min(100, averageConfidence + agreementBonus), votes: agreeing.length };
 }
 
-function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob> {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (blob) resolve(blob);
-      else reject(new Error("图片处理失败"));
-    }, "image/png");
-  });
-}
-
 function parseRecognizedDigit(text: string): number | null {
-  const digit = text.replace(/\D/g, "").charAt(0);
-  if (!digit) return null;
-  const value = Number(digit);
-  return value >= 1 && value <= 9 ? value : null;
+  const digits = text.match(/[1-9]/g) ?? [];
+  if (digits.length !== 1) return null;
+  return Number(digits[0]);
 }
 
 function reportCellProgress(onProgress: ProgressCallback | undefined, row: number, col: number) {
   const done = row * CELL_COUNT + col + 1;
   if (done % 9 === 0 || done === 81) {
-    onProgress?.(`正在补充识别 ${done}/81`, 0.28 + (done / 81) * 0.67);
+    onProgress?.(`正在逐格补识别 ${done}/81`, 0.28 + (done / 81) * 0.67);
   }
 }
 

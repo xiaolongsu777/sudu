@@ -3,5 +3,17 @@ import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   base: "./",
-  plugins: [react()]
+  plugins: [react()],
+  optimizeDeps: {
+    include: ["@paddleocr/paddleocr-js"]
+  },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          ocr: ["@paddleocr/paddleocr-js"]
+        }
+      }
+    }
+  }
 });
