@@ -47,6 +47,6 @@ npm.cmd run build
 ## 说明
 
 - 完全在浏览器运行，不依赖后端或云 OCR。
-- OCR 使用 `@paddleocr/paddleocr-js` / PP-OCRv5，在浏览器端本地运行，并结合整板识别、网格线擦除、坐标回填和逐格补识别。
+- OCR 使用 `@paddleocr/paddleocr-js` / PP-OCRv5，在浏览器端本地运行；具体模型为文本检测 `PP-OCRv5_mobile_det` 和文本识别 `PP-OCRv5_mobile_rec`，并结合整板识别、网格线擦除、坐标回填和逐格补识别。
 - PaddleOCR.js 依赖的 ONNX Runtime Web 资源托管在 `public/ort/`，首次识别需要加载模型和 WASM 资源，可能比后续识别慢一些。
 - OCR 仍可能受照片倾斜、阴影、字体和边框影响，求解前建议核对棋盘数字。
